@@ -16,6 +16,8 @@ type PacketEvent struct {
 	Payload   []byte
 }
 
+// FiveTuple preserves the original transport metadata even though chain_id is
+// now an opaque transaction identifier.
 type FiveTuple struct {
 	LocalIP    string `json:"local_ip"`
 	LocalPort  uint16 `json:"local_port"`
@@ -24,36 +26,28 @@ type FiveTuple struct {
 	Protocol   string `json:"protocol"`
 }
 
+// HTTPRequest keeps only the fields that are useful for downstream analysis
+// and UI display.
 type HTTPRequest struct {
-	Method        string `json:"method"`
-	Path          string `json:"path"`
-	Host          string `json:"host"`
-	Header        string `json:"header"`
-	Body          string `json:"body"`
-	BodyBytes     int    `json:"body_bytes"`
-	ContentLength int    `json:"content_length"`
-	Chunked       bool   `json:"chunked"`
-	Raw           string `json:"raw"`
+	Method    string `json:"method"`
+	URL       string `json:"url"`
+	Path      string `json:"path"`
+	Headers   string `json:"headers"`
+	Body      string `json:"body"`
+	BodyBytes int    `json:"body_bytes"`
 }
 
+// HTTPResponse mirrors the compact request view: status line, headers and body.
 type HTTPResponse struct {
-	StatusLine       string `json:"status_line"`
-	StatusCode       int    `json:"status_code"`
-	Header           string `json:"header"`
-	Body             string `json:"body"`
-	BodyBytes        int    `json:"body_bytes"`
-	ContentLength    int    `json:"content_length"`
-	TransferEncoding string `json:"transfer_encoding"`
-	Chunked          bool   `json:"chunked"`
-	Upgrade          string `json:"upgrade"`
-	Raw              string `json:"raw"`
+	Status     string `json:"status"`
+	StatusCode int    `json:"status_code"`
+	Headers    string `json:"headers"`
+	Body       string `json:"body"`
+	BodyBytes  int    `json:"body_bytes"`
 }
 
-type PendingRequest struct {
-	ChainID        string
-	RequestStartAt time.Time
-}
-
+// FlowRecord is the compact event schema shared by CLI output, Redis storage
+// and the UI. Request and response are emitted as separate records.
 type FlowRecord struct {
 	ID            string        `json:"id"`
 	ChainID       string        `json:"chain_id"`
@@ -63,26 +57,36 @@ type FlowRecord struct {
 	IfIndex       int           `json:"if_index"`
 	Tuple         FiveTuple     `json:"tuple"`
 	Role          string        `json:"role"`
-	Request       HTTPRequest   `json:"request"`
-	Response      HTTPResponse  `json:"response"`
-	RequestAt     time.Time     `json:"request_at"`
-	ResponseAt    time.Time     `json:"response_at"`
-	ResponseEndAt time.Time     `json:"response_end_at"`
-	TTFB          time.Duration `json:"ttfb"`
-	Total         time.Duration `json:"total"`
+	RequestEndSeq uint32        `json:"request_end_seq,omitempty"`
+	ResponseAck   uint32        `json:"response_ack,omitempty"`
+	Request       *HTTPRequest  `json:"request,omitempty"`
+	Response      *HTTPResponse `json:"response,omitempty"`
 }
 
 type Config struct {
-	MaxBodyBytes  int
-	JSONOutput    bool
-	Debug         bool
-	PortFilter    uint16
-	Interface     string
-	InterfaceIdx  int
-	IPFilter      string
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
-	RedisListKey  string
-	RedisMaxItems int64
+	MaxBodyBytes       int
+	JSONOutput         bool
+	Debug              bool
+	VerboseFlowLog     bool
+	PortFilter         uint16
+	Interface          string
+	InterfaceIdx       int
+	IPFilter           string
+	Workers            int
+	GOMAXPROCS         int
+	SinkWorkers        int
+	PacketQueueSize    int
+	WorkerQueueSize    int
+	FlowQueueSize      int
+	SocketRcvBufMB     int
+	RedisAddr          string
+	RedisPassword      string
+	RedisDB            int
+	RedisListKey       string
+	RedisMaxItems      int64
+	RedisFailLog       string
+	RedisWorkers       int
+	RedisQueueSize     int
+	RedisBatchSize     int
+	RedisFlushInterval time.Duration
 }

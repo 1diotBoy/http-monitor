@@ -41,6 +41,15 @@ static __always_inline __u16 bpf_ntohs16(__u16 v) {
 
 SEC("socket")
 int filter_packets(struct __sk_buff *skb) {
+    /*
+     * This program does only cheap packet selection in-kernel:
+     *   1. verify iface / IPv4 / TCP
+     *   2. appxly user-provided iface / port / IP filters
+     *   3. return packet length to keep the frame, or 0 to drop it
+     *
+     * HTTP parsing stays in user space so the same binary can run on older
+     * kernels such as 4.19 without relying on newer eBPF helpers or ringbuf.
+     */
     __u32 key = 0;
     filter_config_t *cfg = bpf_map_lookup_elem(&filter_config, &key);
     if (!cfg) {

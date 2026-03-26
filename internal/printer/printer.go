@@ -4,19 +4,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"kyanos-lite/internal/model"
 )
 
 type Printer struct {
 	jsonOutput bool
+	enabled    bool
+	mu         sync.Mutex
 }
 
-func New(jsonOutput bool) *Printer {
-	return &Printer{jsonOutput: jsonOutput}
+func New(jsonOutput, enabled bool) *Printer {
+	return &Printer{jsonOutput: jsonOutput, enabled: enabled}
 }
 
 func (p *Printer) PrintFlow(flow model.FlowRecord) {
+	if !p.enabled {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.jsonOutput {
 		b, _ := json.Marshal(flow)
 		fmt.Println(string(b))
@@ -27,32 +35,31 @@ func (p *Printer) PrintFlow(flow model.FlowRecord) {
 		flow.When.Format("2006-01-02 15:04:05.000"), flow.IfName, flow.IfIndex, flow.Kind, flow.ChainID, flow.Role)
 	fmt.Printf("tuple=%s:%d -> %s:%d proto=%s\n",
 		flow.Tuple.LocalIP, flow.Tuple.LocalPort, flow.Tuple.RemoteIP, flow.Tuple.RemotePort, flow.Tuple.Protocol)
-	if !flow.RequestAt.IsZero() {
-		fmt.Printf("request_at=%s\n", flow.RequestAt.Format("2006-01-02 15:04:05.000"))
+	if flow.RequestEndSeq != 0 {
+		fmt.Printf("request_end_seq=%d\n", flow.RequestEndSeq)
 	}
-	if !flow.ResponseAt.IsZero() {
-		fmt.Printf("response_at=%s\n", flow.ResponseAt.Format("2006-01-02 15:04:05.000"))
-	}
-	if !flow.ResponseEndAt.IsZero() {
-		fmt.Printf("response_end_at=%s\n", flow.ResponseEndAt.Format("2006-01-02 15:04:05.000"))
+	if flow.ResponseAck != 0 {
+		fmt.Printf("response_ack=%d\n", flow.ResponseAck)
 	}
 	switch flow.Kind {
 	case "request":
-		fmt.Printf("request:  %s %s", flow.Request.Method, flow.Request.Path)
-		if flow.Request.Host != "" {
-			fmt.Printf(" host=%s", flow.Request.Host)
+		if flow.Request == nil {
+			fmt.Println("request: <empty>")
+			return
 		}
+		fmt.Printf("request:  %s %s\n", flow.Request.Method, flow.Request.URL)
 		fmt.Println()
 		fmt.Println("--- request headers ---")
-		fmt.Println(flow.Request.Header)
+		fmt.Println(flow.Request.Headers)
 		printBody("request body", flow.Request.Body, flow.Request.BodyBytes)
 	case "response":
-		fmt.Printf("response: %s\n", flow.Response.StatusLine)
-		if flow.Response.Upgrade != "" || flow.Response.StatusCode == 101 {
-			fmt.Printf("upgrade:  %s\n", flow.Response.Upgrade)
+		if flow.Response == nil {
+			fmt.Println("response: <empty>")
+			return
 		}
+		fmt.Printf("response: %s\n", flow.Response.Status)
 		fmt.Println("--- response headers ---")
-		fmt.Println(flow.Response.Header)
+		fmt.Println(flow.Response.Headers)
 		printBody("response body", flow.Response.Body, flow.Response.BodyBytes)
 	default:
 		fmt.Println("unknown flow kind")

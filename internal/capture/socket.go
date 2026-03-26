@@ -28,7 +28,9 @@ type Interface struct {
 	Name  string
 }
 
-func OpenPacketSocket(ifaceName string, debug bool) (*PacketSocket, error) {
+// OpenPacketSocket binds an AF_PACKET socket to one NIC so the kernel can feed
+// us raw Ethernet frames that already passed the eBPF socket filter.
+func OpenPacketSocket(ifaceName string, debug bool, rcvBufBytes int) (*PacketSocket, error) {
 	if ifaceName == "" {
 		return nil, fmt.Errorf("iface is required")
 	}
@@ -45,13 +47,28 @@ func OpenPacketSocket(ifaceName string, debug bool) (*PacketSocket, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open packet socket: %w", err)
 	}
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20); err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("set receive buffer: %w", err)
+	if rcvBufBytes <= 0 {
+		rcvBufBytes = 64 << 20
 	}
+	// Large receive buffers absorb short bursts so the capture loop has more
+	// room before the kernel starts dropping AF_PACKET frames.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, rcvBufBytes); err != nil {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, rcvBufBytes); err != nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("set receive buffer: %w", err)
+		}
+	}
+	// Not all older kernels expose PACKET_IGNORE_OUTGOING. The default already
+	// keeps egress packets, so unsupported kernels can safely continue.
 	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_IGNORE_OUTGOING, 0); err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("enable outgoing packets: %w", err)
+		if errors.Is(err, unix.ENOPROTOOPT) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
+			if debug {
+				log.Printf("[capture] PACKET_IGNORE_OUTGOING unsupported on this kernel, continuing without it: %v", err)
+			}
+		} else {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("enable outgoing packets: %w", err)
+		}
 	}
 	addr := &unix.SockaddrLinklayer{
 		Protocol: htons(unix.ETH_P_ALL),
@@ -84,6 +101,8 @@ func (s *PacketSocket) Close() error {
 	return nil
 }
 
+// ReadLoop converts raw packets into PacketEvent values that already contain
+// the TCP 5-tuple, seq/ack and L7 payload bytes.
 func (s *PacketSocket) ReadLoop(ctx context.Context, out chan<- model.PacketEvent) error {
 	buf := make([]byte, 64*1024)
 	for {
@@ -117,6 +136,8 @@ func (s *PacketSocket) ReadLoop(ctx context.Context, out chan<- model.PacketEven
 	}
 }
 
+// decodeIPv4Packet walks Ethernet -> optional VLAN -> IPv4 -> TCP and returns
+// only packets that still have application payload bytes.
 func decodeIPv4Packet(buf []byte, iface *Interface, pktType uint8) (model.PacketEvent, bool) {
 	l3Off, ok := ipv4Offset(buf)
 	if !ok {

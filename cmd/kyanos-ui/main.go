@@ -18,17 +18,6 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-type flow struct {
-	ID    string          `json:"id"`
-	When  time.Time       `json:"when"`
-	PID   uint32          `json:"pid"`
-	Comm  string          `json:"comm"`
-	Role  string          `json:"role"`
-	Tuple map[string]any  `json:"tuple"`
-	Req   json.RawMessage `json:"request"`
-	Resp  json.RawMessage `json:"response"`
-}
-
 func main() {
 	var redisAddr, redisPass, redisKey, listen string
 	var redisDB int
@@ -48,6 +37,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/flows", func(w http.ResponseWriter, r *http.Request) {
+		// The UI reads the same compact FlowRecord JSON that the CLI stores in
+		// Redis, so the browser view and JSON lines stay in sync.
 		limit := int64(100)
 		if v := r.URL.Query().Get("limit"); v != "" {
 			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 && n <= 1000 {

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>kyanos-lite UI</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 0; background:#0f172a; color:#e2e8f0; }
+    body { font-family: "Segoe UI", "PingFang SC", sans-serif; margin: 0; background:#0f172a; color:#e2e8f0; }
     .layout { display:flex; height:100vh; }
     .sidebar { width: 44%; border-right:1px solid #334155; overflow:auto; }
     .detail { flex:1; overflow:auto; padding:16px; }
@@ -18,14 +18,18 @@
     pre { white-space:pre-wrap; word-break:break-word; background:#020617; padding:12px; border-radius:12px; border:1px solid #334155; }
     .kv { margin:8px 0; }
     .title { font-weight:bold; margin-bottom:6px; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#1d4ed8; font-size:12px; margin-left:8px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#1d4ed8; font-size:12px; }
+    .pill.request { background:#0f766e; }
+    .pill.response { background:#b45309; }
+    .section { margin-top:18px; }
   </style>
 </head>
 <body>
 <div class="layout">
   <div class="sidebar">
     <div class="toolbar">
-      <input id="q" placeholder="search ip port path pid comm" style="width:55%" />
+      <input id="q" placeholder="search chain_id ip port url status" style="width:55%" />
       <input id="limit" type="number" value="100" min="1" max="1000" style="width:80px" />
       <button onclick="loadFlows()">Refresh</button>
     </div>
@@ -38,6 +42,28 @@
 </div>
 <script>
 let current = null;
+
+function summary(flow) {
+  const req = flow.request || {};
+  const resp = flow.response || {};
+  if (flow.kind === 'request') {
+    return `${req.method || ''} ${req.url || req.path || ''}`.trim();
+  }
+  if (flow.kind === 'response') {
+    const parts = [];
+    if (resp.status_code) parts.push(resp.status_code);
+    if (resp.status) parts.push(resp.status);
+    return parts.join(' ');
+  }
+  return '';
+}
+
+function seqHint(flow) {
+  if (flow.request_end_seq) return `request_end_seq=${flow.request_end_seq}`;
+  if (flow.response_ack) return `response_ack=${flow.response_ack}`;
+  return '';
+}
+
 async function loadFlows() {
   const q = document.getElementById('q').value;
   const limit = document.getElementById('limit').value || 100;
@@ -46,15 +72,18 @@ async function loadFlows() {
   const list = document.getElementById('list');
   list.innerHTML = '';
   (data.items || []).forEach(flow => {
-    const req = flow.request || {};
     const tuple = flow.tuple || {};
     const div = document.createElement('div');
     div.className = 'card' + (current && current.id === flow.id ? ' active' : '');
     div.onclick = () => showFlow(flow);
     div.innerHTML = `
-      <div class="title">${tuple.remote_ip || '-'}:${tuple.remote_port || 0} → ${tuple.local_ip || '-'}:${tuple.local_port || 0}<span class="pill">${flow.role || 'unknown'}</span></div>
-      <div>${req.method || ''} ${req.path || ''}</div>
-      <div class="muted">${flow.comm || ''} pid=${flow.pid || 0} time=${flow.when || ''}</div>
+      <div class="row">
+        <div class="title">${tuple.remote_ip || '-'}:${tuple.remote_port || 0} → ${tuple.local_ip || '-'}:${tuple.local_port || 0}</div>
+        <span class="pill ${esc(flow.kind)}">${esc(flow.kind || 'unknown')}</span>
+        <span class="pill">${esc(flow.role || 'packet')}</span>
+      </div>
+      <div>${esc(summary(flow))}</div>
+      <div class="muted">${esc(seqHint(flow))} time=${esc(flow.when || '')}</div>
     `;
     list.appendChild(div);
   });
@@ -68,24 +97,35 @@ function showFlow(flow) {
   const req = flow.request || {};
   const resp = flow.response || {};
   const tuple = flow.tuple || {};
+  const requestBlock = req.method ? `
+    <div class="section">
+      <h3>Request</h3>
+      <div class="kv"><b>${esc(req.method)} ${esc(req.url || req.path || '')}</b></div>
+      <div class="kv"><b>Headers</b></div>
+      <pre>${esc(req.headers || '')}</pre>
+      <div class="kv"><b>Body (${esc(req.body_bytes || 0)} bytes)</b></div>
+      <pre>${esc(req.body || '')}</pre>
+    </div>
+  ` : '';
+  const responseBlock = resp.status ? `
+    <div class="section">
+      <h3>Response</h3>
+      <div class="kv"><b>${esc(resp.status)}</b></div>
+      <div class="kv"><b>Headers</b></div>
+      <pre>${esc(resp.headers || '')}</pre>
+      <div class="kv"><b>Body (${esc(resp.body_bytes || 0)} bytes)</b></div>
+      <pre>${esc(resp.body || '')}</pre>
+    </div>
+  ` : '';
   document.getElementById('detail').innerHTML = `
     <div class="kv"><b>ID:</b> ${esc(flow.id)}</div>
+    <div class="kv"><b>Chain ID:</b> ${esc(flow.chain_id)}</div>
     <div class="kv"><b>When:</b> ${esc(flow.when)}</div>
-    <div class="kv"><b>Process:</b> ${esc(flow.comm)} pid=${esc(flow.pid)} fd=${esc(flow.fd)}</div>
     <div class="kv"><b>Tuple:</b> ${esc(tuple.remote_ip)}:${esc(tuple.remote_port)} → ${esc(tuple.local_ip)}:${esc(tuple.local_port)} (${esc(tuple.protocol)})</div>
-    <div class="kv"><b>Role:</b> ${esc(flow.role)} | <b>TTFB:</b> ${esc(flow.ttfb)} | <b>Total:</b> ${esc(flow.total)}</div>
-    <h3>Request</h3>
-    <div class="kv"><b>${esc(req.method)} ${esc(req.path)}</b> host=${esc(req.host)}</div>
-    <div class="kv"><b>Headers</b></div>
-    <pre>${esc(req.header || '')}</pre>
-    <div class="kv"><b>Body (${esc(req.body_bytes || 0)} bytes)</b></div>
-    <pre>${esc(req.body || '')}</pre>
-    <h3>Response</h3>
-    <div class="kv"><b>${esc(resp.status_line || '')}</b></div>
-    <div class="kv"><b>Headers</b></div>
-    <pre>${esc(resp.header || '')}</pre>
-    <div class="kv"><b>Body (${esc(resp.body_bytes || 0)} bytes)</b></div>
-    <pre>${esc(resp.body || '')}</pre>
+    <div class="kv"><b>Role:</b> ${esc(flow.role)} | <b>Kind:</b> ${esc(flow.kind)}</div>
+    <div class="kv"><b>request_end_seq:</b> ${esc(flow.request_end_seq || '')} | <b>response_ack:</b> ${esc(flow.response_ack || '')}</div>
+    ${requestBlock}
+    ${responseBlock}
   `;
   loadFlows();
 }

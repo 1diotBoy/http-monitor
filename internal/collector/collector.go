@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"kyanos-lite/internal/model"
@@ -25,40 +26,111 @@ type connKey struct {
 	b endpoint
 }
 
+type txnToken struct {
+	txnSeq        uint64
+	requestEndSeq uint32
+	enqueuedAt    time.Time
+	skip          bool
+}
+
+// connState keeps the minimum state needed to reassemble TCP payloads into
+// HTTP/1.x messages and preserve FIFO request/response ordering.
 type connState struct {
-	ifName            string
-	ifIndex           int
-	lastSeen          time.Time
-	client            endpoint
-	server            endpoint
-	role              string
-	requestBuf        bytes.Buffer
-	requestStartAt    time.Time
-	responseBuf       bytes.Buffer
-	currentResponseAt time.Time
-	pending           []*model.PendingRequest
-	seenPackets       map[string]time.Time
+	ifName             string
+	ifIndex            int
+	connID             uint64
+	requestTxnSeq      uint64
+	responseTxnSeq     uint64
+	lastSeen           time.Time
+	client             endpoint
+	server             endpoint
+	role               string
+	requestBuf         bytes.Buffer
+	requestStartAt     time.Time
+	requestStartSeq    uint32
+	requestNextSeq     uint32
+	requestSeqReady    bool
+	requestFragments   map[uint32][]byte
+	responseBuf        bytes.Buffer
+	currentResponseAt  time.Time
+	currentResponseAck uint32
+	responseNextSeq    uint32
+	responseSeqReady   bool
+	responseFragments  map[uint32][]byte
+	pending            []txnToken
+	pendingHead        int
+	seenPackets        map[string]time.Time
 }
 
 type Collector struct {
-	cfg     model.Config
-	streams map[connKey]*connState
-	printer *printer.Printer
-	store   *store.RedisStore
+	cfg          model.Config
+	streams      map[connKey]*connState
+	printer      *printer.Printer
+	store        *store.RedisStore
+	emit         func(model.FlowRecord)
+	instanceID   string
+	nextConnID   atomic.Uint64
+	nextOrphanID atomic.Uint64
+	ownsStore    bool
 }
 
 func New(cfg model.Config) *Collector {
-	rs, _ := store.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, cfg.RedisListKey, cfg.RedisMaxItems)
+	rs, _ := store.NewRedisStore(
+		cfg.RedisAddr,
+		cfg.RedisPassword,
+		cfg.RedisDB,
+		cfg.RedisListKey,
+		cfg.RedisMaxItems,
+		cfg.RedisFailLog,
+		cfg.RedisWorkers,
+		cfg.RedisQueueSize,
+		cfg.RedisBatchSize,
+		cfg.RedisFlushInterval,
+	)
+	c := &Collector{
+		cfg:        cfg,
+		streams:    make(map[connKey]*connState),
+		printer:    printer.New(cfg.JSONOutput, cfg.VerboseFlowLog),
+		store:      rs,
+		instanceID: fmt.Sprintf("%x", time.Now().UnixNano()),
+		ownsStore:  true,
+	}
+	c.emit = c.emitSync
+	return c
+}
+
+func NewWithDeps(cfg model.Config, pr *printer.Printer, st *store.RedisStore, instanceID string) *Collector {
+	if pr == nil {
+		pr = printer.New(cfg.JSONOutput, cfg.VerboseFlowLog)
+	}
+	if instanceID == "" {
+		instanceID = fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	c := &Collector{
+		cfg:        cfg,
+		streams:    make(map[connKey]*connState),
+		printer:    pr,
+		store:      st,
+		instanceID: instanceID,
+	}
+	c.emit = c.emitSync
+	return c
+}
+
+func NewWithEmitter(cfg model.Config, emit func(model.FlowRecord), instanceID string) *Collector {
+	if instanceID == "" {
+		instanceID = fmt.Sprintf("%x", time.Now().UnixNano())
+	}
 	return &Collector{
-		cfg:     cfg,
-		streams: make(map[connKey]*connState),
-		printer: printer.New(cfg.JSONOutput),
-		store:   rs,
+		cfg:        cfg,
+		streams:    make(map[connKey]*connState),
+		emit:       emit,
+		instanceID: instanceID,
 	}
 }
 
 func (c *Collector) Close() error {
-	if c.store != nil {
+	if c.ownsStore && c.store != nil {
 		return c.store.Close()
 	}
 	return nil
@@ -68,6 +140,9 @@ func (c *Collector) HandlePacket(pkt model.PacketEvent) {
 	if len(pkt.Payload) == 0 {
 		return
 	}
+	// All packets for the same TCP connection share one connState, regardless of
+	// direction. The key is canonicalized so request and response hit the same
+	// buffers and the same per-connection transaction counters.
 	key := canonicalKey(
 		endpoint{ip: pkt.SrcIP, port: pkt.SrcPort},
 		endpoint{ip: pkt.DstIP, port: pkt.DstPort},
@@ -75,10 +150,13 @@ func (c *Collector) HandlePacket(pkt model.PacketEvent) {
 	st, ok := c.streams[key]
 	if !ok {
 		st = &connState{
-			ifName:      pkt.IfName,
-			ifIndex:     pkt.IfIndex,
-			role:        "packet",
-			seenPackets: make(map[string]time.Time),
+			ifName:            pkt.IfName,
+			ifIndex:           pkt.IfIndex,
+			connID:            c.nextConnID.Add(1),
+			role:              "packet",
+			requestFragments:  make(map[uint32][]byte),
+			responseFragments: make(map[uint32][]byte),
+			seenPackets:       make(map[string]time.Time),
 		}
 		c.streams[key] = st
 	}
@@ -172,6 +250,8 @@ func (c *Collector) classify(pkt model.PacketEvent, st *connState) (string, bool
 	}
 }
 
+// handleRequest appends payload into the request-side reassembly buffer. Once a
+// full HTTP message is available, it emits a standalone request event.
 func (c *Collector) handleRequest(pkt model.PacketEvent, st *connState) {
 	if st.requestBuf.Len() == 0 {
 		idx := parser.FindRequestStart(pkt.Payload)
@@ -183,12 +263,20 @@ func (c *Collector) handleRequest(pkt model.PacketEvent, st *connState) {
 		}
 		pkt.Payload = pkt.Payload[idx:]
 		st.requestStartAt = pkt.Timestamp
+		st.requestStartSeq = pkt.Seq + uint32(idx)
+		st.requestNextSeq = st.requestStartSeq
+		st.requestSeqReady = true
 	}
-	_, _ = st.requestBuf.Write(pkt.Payload)
-	resyncRequestBuffer(&st.requestBuf)
+	if appended := appendOrderedPayload(&st.requestBuf, st.requestFragments, &st.requestNextSeq, &st.requestSeqReady, st.requestStartSeqForPacket(pkt), pkt.Payload); appended {
+		resyncRequestBuffer(&st.requestBuf)
+	}
 	if st.requestBuf.Len() > 1024*1024 {
 		st.requestBuf.Reset()
 		st.requestStartAt = time.Time{}
+		st.requestStartSeq = 0
+		st.requestNextSeq = 0
+		st.requestSeqReady = false
+		clear(st.requestFragments)
 		return
 	}
 	for {
@@ -204,38 +292,55 @@ func (c *Collector) handleRequest(pkt model.PacketEvent, st *connState) {
 		if startAt.IsZero() {
 			startAt = pkt.Timestamp
 		}
-		st.pending = append(st.pending, &model.PendingRequest{
-			ChainID:        chainID(st.client, st.server, startAt),
-			RequestStartAt: startAt,
-		})
-		event := model.FlowRecord{
-			ID:        fmt.Sprintf("%s-req-%d", st.client.ip, pkt.Timestamp.UnixNano()),
-			ChainID:   st.pending[len(st.pending)-1].ChainID,
-			Kind:      "request",
-			When:      pkt.Timestamp,
-			IfName:    st.ifName,
-			IfIndex:   st.ifIndex,
-			Role:      st.role,
-			Tuple:     model.FiveTuple{LocalIP: st.client.ip, LocalPort: st.client.port, RemoteIP: st.server.ip, RemotePort: st.server.port, Protocol: "tcp"},
-			Request:   req,
-			RequestAt: startAt,
-		}
-		c.printer.PrintFlow(event)
-		_ = c.store.SaveFlow(event)
-		if c.cfg.Debug {
-			log.Printf("[collector] request parsed: method=%s path=%s host=%s bodyBytes=%d pending=%d",
-				req.Method, req.Path, req.Host, req.BodyBytes, len(st.pending))
+		reqEndSeq := st.requestStartSeq + uint32(consumed)
+		st.requestTxnSeq++
+		txnSeq := st.requestTxnSeq
+		chainID := c.chainIDForTxn(st.connID, txnSeq)
+		skip := shouldSkipStaticResource(req.Path)
+		st.pushPending(txnToken{
+			txnSeq:        txnSeq,
+			requestEndSeq: reqEndSeq,
+			enqueuedAt:    startAt,
+			skip:          skip,
+		}, c.cfg.Debug, c.instanceID, st.connID)
+		if skip {
+			if c.cfg.Debug {
+				log.Printf("[collector] skip static request: method=%s path=%s chain_id=%s req_end_seq=%d pending=%d request_txn=%d response_txn=%d",
+					req.Method, req.Path, chainID, reqEndSeq, st.pendingLen(), st.requestTxnSeq, st.responseTxnSeq)
+			}
+		} else {
+			event := model.FlowRecord{
+				ID:            fmt.Sprintf("%s-req-%d", st.client.ip, startAt.UnixNano()),
+				ChainID:       chainID,
+				Kind:          "request",
+				When:          startAt,
+				IfName:        st.ifName,
+				IfIndex:       st.ifIndex,
+				Role:          st.role,
+				Tuple:         model.FiveTuple{LocalIP: st.client.ip, LocalPort: st.client.port, RemoteIP: st.server.ip, RemotePort: st.server.port, Protocol: "tcp"},
+				RequestEndSeq: reqEndSeq,
+				Request:       &req,
+			}
+			c.emitFlow(event)
+			if c.cfg.Debug {
+				log.Printf("[collector] request parsed: method=%s url=%s bodyBytes=%d chain_id=%s req_end_seq=%d pending=%d request_txn=%d response_txn=%d",
+					req.Method, req.URL, req.BodyBytes, chainID, reqEndSeq, st.pendingLen(), st.requestTxnSeq, st.responseTxnSeq)
+			}
 		}
 		drainBuffer(&st.requestBuf, consumed)
 		resyncRequestBuffer(&st.requestBuf)
 		if st.requestBuf.Len() == 0 {
-			st.requestStartAt = time.Time{}
+			resetRequestStream(st)
 			return
 		}
 		st.requestStartAt = pkt.Timestamp
+		st.requestStartSeq = reqEndSeq
 	}
 }
 
+// handleResponse mirrors handleRequest. Responses pop the oldest outstanding
+// request token from the connection-local FIFO, which matches HTTP/1.x ordering
+// while keeping only tiny metadata per in-flight transaction.
 func (c *Collector) handleResponse(pkt model.PacketEvent, st *connState) {
 	if st.responseBuf.Len() == 0 {
 		idx := parser.FindResponseStart(pkt.Payload)
@@ -247,15 +352,23 @@ func (c *Collector) handleResponse(pkt model.PacketEvent, st *connState) {
 		}
 		pkt.Payload = pkt.Payload[idx:]
 		st.currentResponseAt = pkt.Timestamp
+		st.currentResponseAck = pkt.Ack
+		st.responseNextSeq = pkt.Seq + uint32(idx)
+		st.responseSeqReady = true
 	}
 	if st.currentResponseAt.IsZero() {
 		st.currentResponseAt = pkt.Timestamp
 	}
-	_, _ = st.responseBuf.Write(pkt.Payload)
-	resyncResponseBuffer(&st.responseBuf)
+	if appended := appendOrderedPayload(&st.responseBuf, st.responseFragments, &st.responseNextSeq, &st.responseSeqReady, st.responseSeqForPacket(pkt), pkt.Payload); appended {
+		resyncResponseBuffer(&st.responseBuf)
+	}
 	if st.responseBuf.Len() > 1024*1024 {
 		st.responseBuf.Reset()
 		st.currentResponseAt = time.Time{}
+		st.currentResponseAck = 0
+		st.responseNextSeq = 0
+		st.responseSeqReady = false
+		clear(st.responseFragments)
 		return
 	}
 	for {
@@ -267,53 +380,64 @@ func (c *Collector) handleResponse(pkt model.PacketEvent, st *connState) {
 			}
 			return
 		}
-		if len(st.pending) > 0 {
-			pending := st.pending[0]
-			st.pending = st.pending[1:]
+		if token, ok := st.popPending(); ok {
+			st.responseTxnSeq = token.txnSeq
+			if token.skip {
+				if c.cfg.Debug {
+					log.Printf("[collector] skip static response: chain_id=%s response_ack=%d status=%d pending=%d request_txn=%d response_txn=%d",
+						c.chainIDForTxn(st.connID, token.txnSeq), st.currentResponseAck, resp.StatusCode, st.pendingLen(), st.requestTxnSeq, st.responseTxnSeq)
+				}
+				drainBuffer(&st.responseBuf, consumed)
+				resyncResponseBuffer(&st.responseBuf)
+				resetResponseMessage(st)
+				if st.responseBuf.Len() == 0 {
+					return
+				}
+				continue
+			}
+			if c.cfg.Debug && token.requestEndSeq != 0 && st.currentResponseAck != 0 && st.currentResponseAck < token.requestEndSeq {
+				log.Printf("[collector] transport hint mismatch: chain_id=%s request_end_seq=%d response_ack=%d",
+					c.chainIDForTxn(st.connID, token.txnSeq), token.requestEndSeq, st.currentResponseAck)
+			}
 			flow := model.FlowRecord{
-				ID:            fmt.Sprintf("%s-resp-%d", st.server.ip, pkt.Timestamp.UnixNano()),
-				ChainID:       pending.ChainID,
-				Kind:          "response",
-				When:          pkt.Timestamp,
-				IfName:        st.ifName,
-				IfIndex:       st.ifIndex,
-				Role:          st.role,
-				Tuple:         model.FiveTuple{LocalIP: st.client.ip, LocalPort: st.client.port, RemoteIP: st.server.ip, RemotePort: st.server.port, Protocol: "tcp"},
-				Response:      resp,
-				RequestAt:     pending.RequestStartAt,
-				ResponseAt:    st.currentResponseAt,
-				ResponseEndAt: pkt.Timestamp,
+				ID:          fmt.Sprintf("%s-resp-%d", st.server.ip, st.currentResponseAt.UnixNano()),
+				ChainID:     c.chainIDForTxn(st.connID, token.txnSeq),
+				Kind:        "response",
+				When:        st.currentResponseAt,
+				IfName:      st.ifName,
+				IfIndex:     st.ifIndex,
+				Role:        st.role,
+				Tuple:       model.FiveTuple{LocalIP: st.client.ip, LocalPort: st.client.port, RemoteIP: st.server.ip, RemotePort: st.server.port, Protocol: "tcp"},
+				ResponseAck: st.currentResponseAck,
+				Response:    &resp,
 			}
 			if c.cfg.Debug {
-				log.Printf("[collector] response parsed: status=%d bodyBytes=%d chain_id=%s",
-					resp.StatusCode, resp.BodyBytes, flow.ChainID)
+				log.Printf("[collector] response parsed: status=%d bodyBytes=%d chain_id=%s response_ack=%d pending=%d request_txn=%d response_txn=%d",
+					resp.StatusCode, resp.BodyBytes, flow.ChainID, flow.ResponseAck, st.pendingLen(), st.requestTxnSeq, st.responseTxnSeq)
 			}
-			c.printer.PrintFlow(flow)
-			_ = c.store.SaveFlow(flow)
+			c.emitFlow(flow)
 		} else {
 			if c.cfg.Debug {
-				log.Printf("[collector] parsed response without pending request: status=%d preview=%s",
-					resp.StatusCode, previewBytes(st.responseBuf.Bytes(), 96))
+				log.Printf("[collector] parsed response without outstanding request: status=%d response_ack=%d preview=%s",
+					resp.StatusCode, st.currentResponseAck, previewBytes(st.responseBuf.Bytes(), 96))
 			}
 			flow := model.FlowRecord{
-				ID:            fmt.Sprintf("%s-orphan-resp-%d", st.server.ip, pkt.Timestamp.UnixNano()),
-				ChainID:       chainID(st.client, st.server, pkt.Timestamp),
-				Kind:          "response",
-				When:          pkt.Timestamp,
-				IfName:        st.ifName,
-				IfIndex:       st.ifIndex,
-				Role:          st.role,
-				Tuple:         model.FiveTuple{LocalIP: st.client.ip, LocalPort: st.client.port, RemoteIP: st.server.ip, RemotePort: st.server.port, Protocol: "tcp"},
-				Response:      resp,
-				ResponseAt:    st.currentResponseAt,
-				ResponseEndAt: pkt.Timestamp,
+				ID:          fmt.Sprintf("%s-orphan-resp-%d", st.server.ip, st.currentResponseAt.UnixNano()),
+				ChainID:     c.newOrphanChainID(),
+				Kind:        "response",
+				When:        st.currentResponseAt,
+				IfName:      st.ifName,
+				IfIndex:     st.ifIndex,
+				Role:        st.role,
+				Tuple:       model.FiveTuple{LocalIP: st.client.ip, LocalPort: st.client.port, RemoteIP: st.server.ip, RemotePort: st.server.port, Protocol: "tcp"},
+				ResponseAck: st.currentResponseAck,
+				Response:    &resp,
 			}
-			c.printer.PrintFlow(flow)
-			_ = c.store.SaveFlow(flow)
+			c.emitFlow(flow)
 		}
 		drainBuffer(&st.responseBuf, consumed)
 		resyncResponseBuffer(&st.responseBuf)
-		st.currentResponseAt = time.Time{}
+		resetResponseMessage(st)
 		if st.responseBuf.Len() == 0 {
 			return
 		}
@@ -345,34 +469,23 @@ func (c *Collector) gc(now time.Time) {
 }
 
 func (c *Collector) prunePending(st *connState, now time.Time) {
-	if len(st.pending) == 0 {
+	if st.pendingLen() == 0 {
 		return
 	}
-	const pendingTTL = 30 * time.Second
-	kept := st.pending[:0]
-	for _, p := range st.pending {
-		if now.Sub(p.RequestStartAt) <= pendingTTL {
-			kept = append(kept, p)
-			continue
+	const pendingTTL = 2 * time.Minute
+	for st.pendingLen() > 0 {
+		token := st.pending[st.pendingHead]
+		if now.Sub(token.enqueuedAt) <= pendingTTL {
+			break
 		}
 		if c.cfg.Debug {
-			log.Printf("[collector] drop stale pending request: chain_id=%s age=%s", p.ChainID, now.Sub(p.RequestStartAt))
+			log.Printf("[collector] drop stale pending txn: chain_id=%s age=%s skip=%v",
+				c.chainIDForTxn(st.connID, token.txnSeq), now.Sub(token.enqueuedAt), token.skip)
 		}
+		st.pending[st.pendingHead] = txnToken{}
+		st.pendingHead++
 	}
-	st.pending = kept
-	const pendingCap = 1024
-	if len(st.pending) > pendingCap {
-		sort.Slice(st.pending, func(i, j int) bool {
-			return st.pending[i].RequestStartAt.Before(st.pending[j].RequestStartAt)
-		})
-		dropped := len(st.pending) - pendingCap
-		if c.cfg.Debug {
-			for i := 0; i < dropped; i++ {
-				log.Printf("[collector] drop overflow pending request: chain_id=%s", st.pending[i].ChainID)
-			}
-		}
-		st.pending = append([]*model.PendingRequest(nil), st.pending[dropped:]...)
-	}
+	st.compactPending()
 }
 
 func drainBuffer(buf *bytes.Buffer, n int) {
@@ -384,6 +497,113 @@ func drainBuffer(buf *bytes.Buffer, n int) {
 	rest := append([]byte(nil), b[n:]...)
 	buf.Reset()
 	_, _ = buf.Write(rest)
+}
+
+// appendOrderedPayload turns packet-level TCP payloads into a contiguous byte
+// stream. It trims retransmitted overlap, buffers gaps and flushes buffered
+// out-of-order fragments once the missing bytes arrive.
+func appendOrderedPayload(buf *bytes.Buffer, fragments map[uint32][]byte, nextSeq *uint32, ready *bool, seq uint32, payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	if !*ready {
+		*nextSeq = seq
+		*ready = true
+	}
+	if seq < *nextSeq {
+		overlap := int(*nextSeq - seq)
+		if overlap >= len(payload) {
+			return false
+		}
+		payload = payload[overlap:]
+		seq = *nextSeq
+	}
+	if seq > *nextSeq {
+		storeFragment(fragments, seq, payload)
+		return false
+	}
+	_, _ = buf.Write(payload)
+	*nextSeq += uint32(len(payload))
+	flushOrderedFragments(buf, fragments, nextSeq)
+	return true
+}
+
+func storeFragment(fragments map[uint32][]byte, seq uint32, payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	if existing, ok := fragments[seq]; ok && len(existing) >= len(payload) {
+		return
+	}
+	fragments[seq] = append([]byte(nil), payload...)
+}
+
+func flushOrderedFragments(buf *bytes.Buffer, fragments map[uint32][]byte, nextSeq *uint32) {
+	for {
+		if len(fragments) == 0 {
+			return
+		}
+		keys := make([]uint32, 0, len(fragments))
+		for seq := range fragments {
+			keys = append(keys, seq)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+		progressed := false
+		for _, seq := range keys {
+			payload := fragments[seq]
+			endSeq := seq + uint32(len(payload))
+			if endSeq <= *nextSeq {
+				delete(fragments, seq)
+				continue
+			}
+			if seq > *nextSeq {
+				return
+			}
+			if seq < *nextSeq {
+				payload = payload[int(*nextSeq-seq):]
+			}
+			_, _ = buf.Write(payload)
+			*nextSeq += uint32(len(payload))
+			delete(fragments, seq)
+			progressed = true
+		}
+		if !progressed {
+			return
+		}
+	}
+}
+
+func resetRequestStream(st *connState) {
+	st.requestStartAt = time.Time{}
+	st.requestStartSeq = 0
+	st.requestNextSeq = 0
+	st.requestSeqReady = false
+	clear(st.requestFragments)
+}
+
+func resetResponseMessage(st *connState) {
+	st.currentResponseAt = time.Time{}
+	st.currentResponseAck = 0
+	if st.responseBuf.Len() == 0 {
+		st.responseNextSeq = 0
+		st.responseSeqReady = false
+		clear(st.responseFragments)
+	}
+}
+
+func (st *connState) requestStartSeqForPacket(pkt model.PacketEvent) uint32 {
+	if st.requestBuf.Len() == 0 && st.requestSeqReady {
+		return st.requestStartSeq
+	}
+	return pkt.Seq
+}
+
+func (st *connState) responseSeqForPacket(pkt model.PacketEvent) uint32 {
+	if st.responseBuf.Len() == 0 && st.responseSeqReady {
+		return st.responseNextSeq
+	}
+	return pkt.Seq
 }
 
 func resyncRequestBuffer(buf *bytes.Buffer) {
@@ -451,7 +671,94 @@ func previewBytes(b []byte, limit int) string {
 	return sb.String()
 }
 
-func chainID(client, server endpoint, t time.Time) string {
-	return fmt.Sprintf("%s:%d-%s:%d-%d",
-		client.ip, client.port, server.ip, server.port, t.UnixNano())
+func (c *Collector) chainIDForTxn(connID, txnSeq uint64) string {
+	return fmt.Sprintf("%s-%016x-%016x", c.instanceID, connID, txnSeq)
+}
+
+func (c *Collector) newOrphanChainID() string {
+	seq := c.nextOrphanID.Add(1)
+	return fmt.Sprintf("%s-orphan-%016x", c.instanceID, seq)
+}
+
+func (st *connState) pushPending(token txnToken, debug bool, instanceID string, connID uint64) {
+	st.pending = append(st.pending, token)
+	const maxPendingPerConn = 4096
+	if st.pendingLen() <= maxPendingPerConn {
+		return
+	}
+	dropped := st.pending[st.pendingHead]
+	st.pending[st.pendingHead] = txnToken{}
+	st.pendingHead++
+	st.compactPending()
+	if debug {
+		log.Printf("[collector] drop oldest pending txn due to cap: chain_id=%s pending=%d",
+			fmt.Sprintf("%s-%016x-%016x", instanceID, connID, dropped.txnSeq), st.pendingLen())
+	}
+}
+
+func (st *connState) popPending() (txnToken, bool) {
+	if st.pendingLen() == 0 {
+		return txnToken{}, false
+	}
+	token := st.pending[st.pendingHead]
+	st.pending[st.pendingHead] = txnToken{}
+	st.pendingHead++
+	st.compactPending()
+	return token, true
+}
+
+func (st *connState) pendingLen() int {
+	return len(st.pending) - st.pendingHead
+}
+
+func (st *connState) compactPending() {
+	if st.pendingHead == 0 {
+		return
+	}
+	if st.pendingHead < len(st.pending)/2 && st.pendingHead < 1024 {
+		return
+	}
+	st.pending = append([]txnToken(nil), st.pending[st.pendingHead:]...)
+	st.pendingHead = 0
+}
+
+func shouldSkipStaticResource(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	if idx := strings.IndexByte(path, '#'); idx >= 0 {
+		path = path[:idx]
+	}
+	path = strings.ToLower(path)
+	for _, suffix := range []string{
+		".js", ".css", ".jpg", ".jpeg", ".png",
+		".gif", ".svg", ".ico", ".webp", ".map",
+		".woff", ".woff2", ".ttf", ".eot", ".otf",
+	} {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Collector) emitFlow(flow model.FlowRecord) {
+	if c.emit != nil {
+		c.emit(flow)
+		return
+	}
+	c.emitSync(flow)
+}
+
+func (c *Collector) emitSync(flow model.FlowRecord) {
+	if c.printer != nil {
+		c.printer.PrintFlow(flow)
+	}
+	if c.store != nil {
+		_ = c.store.SaveFlow(flow)
+	}
 }

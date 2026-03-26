@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"kyanos-lite/internal/model"
 )
@@ -77,15 +79,12 @@ func ParseRequest(raw []byte, maxBody int) (model.HTTPRequest, bool) {
 	body, _ := readBodyLimited(maxBody, r.Body)
 	body, _ = decodeBody(body, r.Header.Get("Content-Encoding"))
 	return model.HTTPRequest{
-		Method:        r.Method,
-		Path:          r.URL.RequestURI(),
-		Host:          r.Host,
-		Header:        headerOnly(raw),
-		Body:          safeBodyString(body),
-		BodyBytes:     len(body),
-		ContentLength: int(r.ContentLength),
-		Chunked:       hasChunked(r.TransferEncoding),
-		Raw:           safeBodyString(raw),
+		Method:    r.Method,
+		URL:       requestURL(r),
+		Path:      r.URL.RequestURI(),
+		Headers:   headerOnly(raw),
+		Body:      safeBodyString(body),
+		BodyBytes: len(body),
 	}, true
 }
 
@@ -97,19 +96,16 @@ func ParseResponse(raw []byte, maxBody int) (model.HTTPResponse, bool) {
 	body, _ := readBodyLimited(maxBody, resp.Body)
 	body, _ = decodeBody(body, resp.Header.Get("Content-Encoding"))
 	return model.HTTPResponse{
-		StatusLine:       strings.TrimSpace(resp.Proto + " " + resp.Status),
-		StatusCode:       resp.StatusCode,
-		Header:           headerOnly(raw),
-		Body:             safeBodyString(body),
-		BodyBytes:        len(body),
-		ContentLength:    int(resp.ContentLength),
-		TransferEncoding: strings.Join(resp.TransferEncoding, ","),
-		Chunked:          hasChunked(resp.TransferEncoding),
-		Upgrade:          resp.Header.Get("Upgrade"),
-		Raw:              safeBodyString(raw),
+		Status:     strings.TrimSpace(resp.Proto + " " + resp.Status),
+		StatusCode: resp.StatusCode,
+		Headers:    headerOnly(raw),
+		Body:       safeBodyString(body),
+		BodyBytes:  len(body),
 	}, true
 }
 
+// extractHTTPMessage finds one complete HTTP/1.x message in a byte stream. The
+// collector calls this repeatedly against its reassembly buffers.
 func extractHTTPMessage(buf []byte, isResp bool) ([]byte, bool) {
 	headerEnd := headerEndIndex(buf)
 	if headerEnd < 0 {
@@ -208,6 +204,19 @@ func hasChunked(v []string) bool {
 		}
 	}
 	return false
+}
+
+func requestURL(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	if u := r.URL.String(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	if r.Host == "" {
+		return r.URL.RequestURI()
+	}
+	return "http://" + r.Host + r.URL.RequestURI()
 }
 
 func chunkedBodyEnd(body []byte) (int, bool) {
@@ -312,13 +321,35 @@ func safeBodyString(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
-	if isMostlyPrintableUTF8(b) {
+	if isMostlyPrintableText(b) {
 		return string(b)
 	}
 	return "<binary body omitted>"
 }
 
-func isMostlyPrintableUTF8(b []byte) bool {
+func isMostlyPrintableText(b []byte) bool {
+	if utf8.Valid(b) {
+		return isMostlyPrintableRunes(string(b))
+	}
+	return isMostlyPrintableBytes(b)
+}
+
+func isMostlyPrintableRunes(s string) bool {
+	printable := 0
+	total := 0
+	for _, r := range s {
+		total++
+		if r == '\n' || r == '\r' || r == '\t' || unicode.IsPrint(r) {
+			printable++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return printable*100/total >= 85
+}
+
+func isMostlyPrintableBytes(b []byte) bool {
 	printable := 0
 	for _, c := range b {
 		if c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c < 127) {
